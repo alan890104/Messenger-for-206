@@ -8,24 +8,42 @@ import threading
 import socket
 import select
 import queue
+import winsound
 from io import BytesIO
 from threading import RLock
 from datetime import datetime
 from PIL import Image, ImageTk
 from utility.encrypt_decript import Ende
-
+import multiprocessing
+from multiprocessing import Process
 import tkinter as tk
 import tkinter.font as tkFont
 from tkinter.filedialog import askdirectory,askopenfilename
 from tkinter import messagebox
+
+from file_transfer import file_client,file_server
 # tcp port 9487 to send file
 # tcp port 3000 -> chatroom server side
 
+with open('settings.json','r',encoding='utf8') as G:
+    Settings = json.load(G)
+
+Process_Queue = multiprocessing.Queue(maxsize=-1)
 usr_ip = {"Fgjyh":"140.113.67.124","David":"140.113.67.122","Alan":"140.113.67.121"}
 ip_to_usr = {"140.113.67.124":"Fgjyh","140.113.67.122":"David","140.113.67.121":"Alan"}
 LOCK = RLock()
 my_ip = socket.gethostbyname_ex(socket.gethostname())[-1][-1]
+if my_ip not in ip_to_usr:
+    messagebox.showerror("警告","你沒有權限使用這個應用程式，請註冊你的帳號")
 
+
+
+def play_sound(soundpath:str):
+    if Settings['sound']==1:
+        try:
+            winsound.PlaySound(soundpath, winsound.SND_FILENAME|winsound.SND_NOSTOP|winsound.SND_ASYNC)
+        except RuntimeError:
+            pass
 
 def Pack_header(content,time=None,types='normal',name=None):
     '''
@@ -44,6 +62,9 @@ def Pack_header(content,time=None,types='normal',name=None):
     if types=='pic':
         # 如果要傳送圖片，則content中會放port number
         pass
+    if types=='file':
+        # 如果要傳送檔案，則content中不放東西
+        pass
     packing = {"time":time,"types":types,"name":name,"content":content}
     return json.dumps(packing)
 
@@ -59,7 +80,8 @@ def Unpack_header(json_obj):
             Show_Msg.insert('end'," {}[{}]: {}".format(name,time,content),'code')  
             Show_Msg.see("end")   
     elif types=='file':
-        pass
+        print('開啟新的process接收file')
+        Process(target=file_client,args=(usr_ip[name],Process_Queue,)).start()
     elif types=='pic':
         print('open a thread to receive picture.')
         threading.Thread(target=picture_client,args=(usr_ip[name],int(content),name,)).start()
@@ -73,6 +95,7 @@ def Unpack_header(json_obj):
             if len(Show_Msg.get("1.0","end").strip())>0: Show_Msg.insert('end',"\n")
             Show_Msg.insert('end'," {}[{}]: {}".format(name,time,content))  
             Show_Msg.see("end")
+        threading.Thread(target=play_sound,args=("sound\m1.wav",)).start()
     else:
         print('error '+json_obj)
 
@@ -157,21 +180,43 @@ class Chatting_server(threading.Thread):
                     else:
                         print("失敗 client sock list:",self.client_sock)
 
-    def send_to_every_one(self,msg):
+    def send_to_every_one(self,msg,whos_ip=None):
+        # whos_ip是一個ip, 傳送給指定的人
         if len(msg)>60000:
             messagebox.showerror("警告","一次不得傳送超過60000字")
             return
-        for ss in self.client_sock:
-            try:
-                if ss.getpeername()[0]!=self.server_soc.getsockname()[0]:
-                    token = self.Ende.encrypt(msg.encode())
-                    if len(token)>100:
-                        token = zlib.compress(token,zlib.Z_BEST_COMPRESSION)
-                    ss.sendall(token)
-            except:
-                print("遠端{}已經不再運作".format(ss))
-                ss.close()
-                self.client_sock.remove(ss)
+        if whos_ip==None:
+            tmp_client_sock = self.client_sock
+            for ss in tmp_client_sock:
+                try:
+                    if ss.getpeername()[0]!=self.server_soc.getsockname()[0]:
+                        token = self.Ende.encrypt(msg.encode())
+                        if len(token)>100:
+                            token = zlib.compress(token,zlib.Z_BEST_COMPRESSION)
+                        ss.sendall(token)
+                except:
+                    print("遠端{}已經不再運作".format(ss))
+                    ss.close()
+                    self.client_sock.remove(ss)
+                    self.create_client_sock()
+                    self.send_to_every_one(msg,whos_ip)
+        else:
+            tmp_client_sock = self.client_sock
+            for ss in tmp_client_sock:
+                try:
+                    if ss.getpeername()[0]==whos_ip:
+                        if ss.getpeername()[0]!=self.server_soc.getsockname()[0]:
+                            token = self.Ende.encrypt(msg.encode())
+                            if len(token)>100:
+                                token = zlib.compress(token,zlib.Z_BEST_COMPRESSION)
+                            ss.sendall(token)
+                except:
+                    print("遠端{}已經不再運作".format(ss))
+                    ss.close()
+                    self.client_sock.remove(ss)
+                    self.create_client_sock()
+                    self.send_to_every_one(msg,whos_ip)
+                    
 
 
     def run(self):
@@ -188,7 +233,16 @@ class Chatting_server(threading.Thread):
                     goodbye.close()
                 self.client_sock.clear()
                 self.inout.clear()
-                break                   
+                break
+
+            if not Process_Queue.empty(): # 傳送檔案結束會發送訊息
+                ip,text = Process_Queue.get_nowait()   
+                now = datetime.now().strftime("%H:%M")
+                with LOCK:
+                    if len(Show_Msg.get("1.0","end").strip())>0: Show_Msg.insert('end',"\n")
+                    Show_Msg.insert('end'," {}[{}]: {}".format(ip_to_usr[ip],now,text),'system')
+                    Show_Msg.see("end")                
+                threading.Thread(target=play_sound,args=("sound\m2.wav",)).start()
 
             readible,_,_ = select.select(self.inout,[],[],1)
             for s in readible:
@@ -205,7 +259,7 @@ class Chatting_server(threading.Thread):
                             continue
                         self.inout.append(client_socket)
                         now = datetime.now().strftime("%H:%M")
-                        print("client connect")
+                        print("client {}  connect ".format(client_socket))
                         with LOCK:
                             self.create_client_sock(ip=client_socket.getpeername()[0]) # 有人與你連線，你也試圖與他進行互聯
                             if len(Show_Msg.get("1.0","end").strip())>0: Show_Msg.insert('end',"\n")
@@ -223,6 +277,7 @@ class Chatting_server(threading.Thread):
                         if msg==b"":
                             print("remove from client sock")
                             s.close()
+                            self.client_sock.remove(s)
                             self.inout.remove(s)
                         else:
                             print("Clinet sock {} 收到 {}".format(s,msg))
@@ -263,6 +318,7 @@ class App():
         screenwidth = root.winfo_screenwidth()
         screenheight = root.winfo_screenheight()
         alignstr = '%dx%d+%d+%d' % (width, height, (screenwidth - width) / 2, (screenheight - height) / 2)
+        root.configure(background='orange')
         root.geometry(alignstr)
         root.resizable(width=False, height=False)
         # 傳送按鈕
@@ -308,7 +364,7 @@ class App():
         Vertical_scroll = tk.Scrollbar(root) # 顯示框的垂直scroll bar
         Vertical_scroll.place(x=536,y=60,width=10,height=582)
         Vertical_scroll.config(command=Show_Msg.yview)
-        
+         
         Show_Msg.tag_config('code', background="black", foreground="white",font=("Times New Roman", "12", "bold")) # code
         Show_Msg.tag_config('system', background="#f2e3bb", foreground="green") # 系統字體
         Show_Msg.tag_config('myself', background="#f2e3bb", foreground="red") # 讓自己的字更改顏色以區別
@@ -398,10 +454,10 @@ class App():
         alignstr = '%dx%d+%d+%d' % (width, height, (screenwidth - width) / 2, (screenheight - height) / 2)
         Top_pop.geometry(alignstr)
         Top_pop.resizable(width=False, height=False)
-        # 選擇要傳送給誰
+        # 選擇要傳送給誰的LABEL
         lab_ask = tk.Label(Top_pop, text = '傳送圖片:', justify=tk.CENTER, width=50,font=font_setting)
         lab_ask.place(x=10, y=50, width=100, height=20)
-        # 顯示選擇的路徑
+        # 顯示選擇的路徑的顯示欄
         selected_path = tk.Text(Top_pop,width = 100,font=font_setting)
         selected_path.delete("1.0", 'end')
         selected_path.insert('end','')
@@ -502,6 +558,9 @@ class App():
                 if os.path.exists(s_path):
                     folder_path.set(s_path)
                     now = datetime.now().strftime("%H:%M")
+                    cht_ser.send_to_every_one(Pack_header('',types='file'),which_ip.get())
+                    cht_ser.send_to_every_one(Pack_header('傳送了一個檔案給你!'),which_ip.get())
+                    Process(target=file_server,args=(s_path,which_ip.get(),)).start()
                     text = "您傳送了一個檔案"
                     with LOCK:
                         Show_Msg.insert('end',"\n {}[{}]: {}".format("system",now,text),'system')
@@ -519,17 +578,23 @@ def picture_client(ip,port,name):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.connect((ip,port))
+    s.settimeout(5)
     BUF=b""
     while True:
-        data = s.recv(500)
-        if not data:
-            break
-        BUF+=data
-    with LOCK:
-        Show_Msg.insert('end',"\n {}[{}]:\n".format(name,datetime.now().strftime("%H:%M")))
-        app.image.append(ImageTk.PhotoImage(Image.open(io.BytesIO(BUF)).resize((300, 300))))
-        Show_Msg.image_create("end",image=app.image[-1])
-        Show_Msg.see("end")
+        try:
+            data = s.recv(500)
+            if not data:
+                break
+            BUF+=data
+        except socket.timeout:
+            pass
+        else:
+            with LOCK:
+                Show_Msg.insert('end',"\n {}[{}]:\n".format(name,datetime.now().strftime("%H:%M")))
+                app.image.append(ImageTk.PhotoImage(Image.open(io.BytesIO(BUF)).resize((300, 300))))
+                Show_Msg.image_create("end",image=app.image[-1])
+                Show_Msg.see("end")
+            threading.Thread(target=play_sound,args=("sound\m1.wav",)).start()
 
 # 接收傳送圖片請求的
 def picture_server(path):
@@ -545,7 +610,7 @@ def picture_server(path):
         # 先告知對方SERVER3000即將開始傳送訊息
         cht_ser.send_to_every_one(Pack_header(pic_server_port,types='pic'))
         s.listen(2)
-        s.settimeout(20)
+        s.settimeout(5)
         try:
             for _ in range(len(cht_ser.client_sock)):
                 client_socket,_ = s.accept()
